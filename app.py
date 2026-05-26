@@ -1,5 +1,8 @@
 import io
 import os
+
+os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+
 import streamlit as st
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
