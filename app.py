@@ -1,4 +1,5 @@
 import io
+import hashlib
 import os
 
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
@@ -10,6 +11,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_pinecone import PineconeVectorStore
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pinecone import Pinecone, ServerlessSpec
+from pydantic import SecretStr
 from pypdf import PdfReader
 
 load_dotenv()
@@ -20,15 +22,18 @@ TOP_K = 3
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 GROQ_MODEL = "llama-3.3-70b-versatile"
 
-
-def get_env_config() -> tuple[str, str, str]:
+def get_env_config() -> tuple[str | None, str | None, str | None]:
     groq_api_key = os.getenv("GROQ_API_KEY")
     pinecone_api_key = os.getenv("PINECONE_API_KEY")
     index_name = os.getenv("PINECONE_INDEX_NAME")
     return groq_api_key, pinecone_api_key, index_name
 
 
-def validate_env(groq_api_key: str, pinecone_api_key: str, index_name: str) -> None:
+def validate_env(
+    groq_api_key: str | None,
+    pinecone_api_key: str | None,
+    index_name: str | None,
+) -> tuple[str, str, str]:
     missing = []
     if not groq_api_key:
         missing.append("GROQ_API_KEY")
@@ -41,6 +46,19 @@ def validate_env(groq_api_key: str, pinecone_api_key: str, index_name: str) -> N
         st.error("Missing required environment variables: " + ", ".join(missing))
         st.stop()
 
+    return groq_api_key or "", pinecone_api_key or "", index_name or ""
+
+
+def initialize_session_state() -> None:
+    st.session_state.setdefault("vector_store", None)
+    st.session_state.setdefault("uploaded_pdf_hashes", set())
+    st.session_state.setdefault("processed_selection_signature", "")
+    st.session_state.setdefault("chat_history", [])
+
+
+def hash_pdf_bytes(pdf_bytes: bytes) -> str:
+    return hashlib.sha256(pdf_bytes).hexdigest()
+
 
 @st.cache_data(show_spinner=False)
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
@@ -49,20 +67,25 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     return "\n".join(pages).strip()
 
 
-def build_file_signature(file_name: str, pdf_bytes: bytes) -> str:
-    return f"{file_name}_{len(pdf_bytes)}"
-
-
-def extract_texts_from_pdfs(uploaded_files) -> tuple[list[str], str]:
+def extract_texts_from_pdfs(uploaded_files, known_hashes: set[str]) -> tuple[list[str], list[str], list[str], list[str]]:
     all_chunks: list[str] = []
-    file_ids: list[str] = []
+    new_hashes: list[str] = []
+    duplicate_files: list[str] = []
+    unreadable_files: list[str] = []
 
     for uploaded_file in uploaded_files:
         pdf_bytes = uploaded_file.getvalue()
-        file_ids.append(build_file_signature(uploaded_file.name, pdf_bytes))
+        pdf_hash = hash_pdf_bytes(pdf_bytes)
+
+        if pdf_hash in known_hashes:
+            duplicate_files.append(uploaded_file.name)
+            continue
+
+        new_hashes.append(pdf_hash)
 
         text = extract_text_from_pdf(pdf_bytes)
         if not text:
+            unreadable_files.append(uploaded_file.name)
             continue
 
         chunks = split_text(text)
@@ -70,7 +93,7 @@ def extract_texts_from_pdfs(uploaded_files) -> tuple[list[str], str]:
             f"Source: {uploaded_file.name}\n{chunk}" for chunk in chunks
         )
 
-    return all_chunks, "|".join(sorted(file_ids))
+    return all_chunks, new_hashes, duplicate_files, unreadable_files
 
 
 @st.cache_data(show_spinner=False)
@@ -90,8 +113,8 @@ def get_embeddings() -> HuggingFaceEmbeddings:
 @st.cache_resource
 def get_llm(groq_api_key: str) -> ChatGroq:
     return ChatGroq(
-        groq_api_key=groq_api_key,
-        model_name=GROQ_MODEL,
+        api_key=SecretStr(groq_api_key),
+        model=GROQ_MODEL,
         temperature=0.3,
     )
 
@@ -116,6 +139,15 @@ def ensure_index(pc: Pinecone, index_name: str) -> None:
         )
 
 
+def get_existing_vector_count(pc: Pinecone, index_name: str) -> int:
+    try:
+        stats = pc.Index(index_name).describe_index_stats()
+        total = getattr(stats, "total_vector_count", 0)
+        return int(total or 0)
+    except Exception:
+        return 0
+
+
 def build_prompt(context: str, question: str) -> str:
     return (
         "You are a helpful assistant answering questions from a PDF. "
@@ -132,12 +164,11 @@ def get_vector_store(
     chunks: list[str],
     embeddings: HuggingFaceEmbeddings,
     index_name: str,
-    file_id: str,
 ) -> PineconeVectorStore:
-    cached_id = st.session_state.get("indexed_file_id")
     cached_store = st.session_state.get("vector_store")
 
-    if cached_store and cached_id == file_id:
+    if cached_store:
+        cached_store.add_texts(chunks)
         return cached_store
 
     vector_store = PineconeVectorStore.from_texts(
@@ -145,66 +176,129 @@ def get_vector_store(
         embedding=embeddings,
         index_name=index_name,
     )
-    st.session_state.indexed_file_id = file_id
     st.session_state.vector_store = vector_store
     return vector_store
+
+
+def get_connected_vector_store(
+    embeddings: HuggingFaceEmbeddings,
+    index_name: str,
+) -> PineconeVectorStore:
+    cached_store = st.session_state.get("vector_store")
+    if cached_store:
+        return cached_store
+
+    vector_store = PineconeVectorStore(
+        index_name=index_name,
+        embedding=embeddings,
+    )
+    st.session_state.vector_store = vector_store
+    return vector_store
+
+
+def render_chat_history() -> None:
+    for msg in st.session_state.chat_history:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
 
 
 def main() -> None:
     st.set_page_config(page_title="THE KNOWLEDGE BOT", layout="wide")
     st.title("📄 THE KNOWLEDGE BOT")
+    initialize_session_state()
 
     groq_api_key, pinecone_api_key, index_name = get_env_config()
-    validate_env(groq_api_key, pinecone_api_key, index_name)
-
-    uploaded_files = st.file_uploader(
-        "Upload PDF",
-        type="pdf",
-        accept_multiple_files=True,
+    groq_api_key, pinecone_api_key, index_name = validate_env(
+        groq_api_key,
+        pinecone_api_key,
+        index_name,
     )
-    if not uploaded_files:
-        return
-
-    file_id = "|".join(
-        sorted(
-            build_file_signature(uploaded_file.name, uploaded_file.getvalue())
-            for uploaded_file in uploaded_files
-        )
-    )
-
-    st.success(f"{len(uploaded_files)} PDF(s) uploaded successfully")
-
-    chunks, _ = extract_texts_from_pdfs(uploaded_files)
-    if not chunks:
-        st.error("No readable text found in the uploaded PDFs.")
-        return
-
-    if not chunks:
-        st.error("Unable to create text chunks from these PDFs.")
-        return
 
     embeddings = get_embeddings()
     pc = Pinecone(api_key=pinecone_api_key)
     ensure_index(pc, index_name)
+    vector_store = get_connected_vector_store(embeddings, index_name)
+    existing_vectors = get_existing_vector_count(pc, index_name)
 
-    vector_store = get_vector_store(chunks, embeddings, index_name, file_id)
+    with st.sidebar:
+        st.header("Knowledge Upload")
+        st.caption("Upload once, then chat directly. Existing Pinecone data is reused automatically.")
 
-    st.write(f"Total Chunks: {len(chunks)}")
-    query = st.text_input("Ask your question")
+        uploaded_files = st.file_uploader(
+            "Upload PDF",
+            type="pdf",
+            accept_multiple_files=True,
+        )
+
+        if st.button("Process Uploads", use_container_width=True):
+            if not uploaded_files:
+                st.info("Select one or more PDFs first.")
+            else:
+                current_selection_signature = "|".join(
+                    sorted(
+                        hash_pdf_bytes(uploaded_file.getvalue())
+                        for uploaded_file in uploaded_files
+                    )
+                )
+
+                if current_selection_signature == st.session_state.processed_selection_signature:
+                    st.info("These files were already processed in this session.")
+                else:
+                    chunks, new_hashes, duplicate_files, unreadable_files = extract_texts_from_pdfs(
+                        uploaded_files,
+                        st.session_state.uploaded_pdf_hashes,
+                    )
+
+                    if duplicate_files:
+                        st.warning(
+                            "Already loaded in this session: " + ", ".join(duplicate_files)
+                        )
+
+                    if unreadable_files:
+                        st.error(
+                            "No readable text found in: " + ", ".join(unreadable_files)
+                        )
+
+                    if chunks:
+                        vector_store = get_vector_store(chunks, embeddings, index_name)
+                        st.session_state.uploaded_pdf_hashes.update(new_hashes)
+                        st.success(f"Added {len(new_hashes)} new PDF(s).")
+                    else:
+                        st.info("No new readable text was added.")
+
+                    st.session_state.processed_selection_signature = current_selection_signature
+
+        st.divider()
+        st.write(f"Session uploads: {len(st.session_state.uploaded_pdf_hashes)}")
+
+    st.subheader("Chat with Your Knowledge Base")
+
+    if existing_vectors == 0 and not st.session_state.uploaded_pdf_hashes:
+        st.info("Upload PDFs from the sidebar to start chatting.")
+        return
+
+    render_chat_history()
+    query = st.chat_input("Ask a question about your PDFs...")
 
     if not query:
         return
 
-    with st.spinner("Searching..."):
-        docs = vector_store.similarity_search(query, k=TOP_K)
-        context = "\n\n".join(doc.page_content for doc in docs)
+    st.session_state.chat_history.append({"role": "user", "content": query})
+    with st.chat_message("user"):
+        st.markdown(query)
 
-        llm = get_llm(groq_api_key)
-        response = llm.invoke(build_prompt(context, query))
-        answer = response.content if hasattr(response, "content") else str(response)
+    with st.chat_message("assistant"):
+        with st.spinner("Searching..."):
+            docs = vector_store.similarity_search(query, k=TOP_K)
+            context = "\n\n".join(doc.page_content for doc in docs)
 
-    st.subheader("Answer")
-    st.text_area("", value=answer, height=500)
+            llm = get_llm(groq_api_key)
+            response = llm.invoke(build_prompt(context, query))
+            answer = response.content if hasattr(response, "content") else str(response)
+
+        st.markdown(answer)
+
+    st.session_state.chat_history.append({"role": "assistant", "content": answer})
 
 
 if __name__ == "__main__":

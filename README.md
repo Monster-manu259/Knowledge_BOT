@@ -3,7 +3,8 @@ Q&A Assistance
 A Streamlit-based app for RAG Flow.
 
 Usage flow:
-- Upload PDFs → extract text → split into chunks → embed & index → ask a question → receive an answer from the LLM.
+- Upload PDFs (sidebar) → process once → ask in chat window → receive answers from the LLM.
+- Existing Pinecone index data is reused on next app runs, so re-upload is not required every time.
 
 Required environment variables:
 - `GROQ_API_KEY`, `PINECONE_API_KEY`, `PINECONE_INDEX_NAME`
