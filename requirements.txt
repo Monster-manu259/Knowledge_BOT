@@ -5,6 +5,7 @@ langchain-text-splitters
 langchain-community
 langchain-groq
 langchain-huggingface
+langchain-pinecone
 pinecone
 sentence-transformers
 torchvision
