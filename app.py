@@ -222,7 +222,7 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Knowledge Upload")
-        st.caption("Upload once, then chat directly. Existing Pinecone data is reused automatically.")
+        st.caption("Upload once, then chat directly.")
 
         uploaded_files = st.file_uploader(
             "Upload PDF",
